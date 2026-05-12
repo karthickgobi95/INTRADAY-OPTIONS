@@ -102,9 +102,14 @@ def download_and_extract_instruments():
     status_placeholder.info("Downloading latest NSE.json from Upstox...")
     
     try:
-        # Download
-        response = requests.get(INSTRUMENTS_URL, stream=True)
-        response.raise_for_status()
+        # Download with timeout and potential SSL handling
+        try:
+            response = requests.get(INSTRUMENTS_URL, stream=True, timeout=30)
+            response.raise_for_status()
+        except requests.exceptions.SSLError:
+            status_placeholder.warning("SSL Certificate verification failed. Retrying without verification (not recommended but may work)...")
+            response = requests.get(INSTRUMENTS_URL, stream=True, timeout=30, verify=False)
+            response.raise_for_status()
         
         status_placeholder.info("Extracting NSE.json...")
         
@@ -127,7 +132,7 @@ def download_and_extract_instruments():
         return False
 
 # --- Data Loading ---
-@st.cache_data(ttl=3600*4, show_spinner=False)  # Cache for 4 hours
+@st.cache_data(ttl=3600*4, show_spinner=True)  # Cache for 4 hours
 def load_data():
     df = None
     
@@ -135,8 +140,9 @@ def load_data():
     if is_file_fresh(CACHE_FILE):
         try:
             df = pd.read_pickle(CACHE_FILE)
-            # print("DEBUG: Loaded from Pickle Cache")
-        except Exception:
+            # st.info("Loaded instruments from cache.")
+        except Exception as e:
+            st.warning(f"Could not load pickle cache: {e}")
             df = None
 
     # 2. If no cache, load from raw JSON
@@ -146,13 +152,24 @@ def load_data():
             if not download_and_extract_instruments():
                  # If download failed, try to use existing file
                  if not os.path.exists(INSTRUMENTS_FILE):
+                     st.error("NSE.json missing and download failed.")
                      return pd.DataFrame(), pd.DataFrame()
+                 else:
+                     st.warning("Download failed, using existing (possibly outdated) NSE.json")
 
         # Load and Filter NSE.json directly
         try:
+            if not os.path.exists(INSTRUMENTS_FILE):
+                st.error(f"Critical Error: {INSTRUMENTS_FILE} does not exist.")
+                return pd.DataFrame(), pd.DataFrame()
+                
             with open(INSTRUMENTS_FILE, 'r') as f:
                 data = json.load(f)
                 
+            if not isinstance(data, list):
+                st.error(f"Unexpected data format in {INSTRUMENTS_FILE}. Expected a list.")
+                return pd.DataFrame(), pd.DataFrame()
+
             # Filter list before creating DataFrame
             filtered_data = [
                 row for row in data 
@@ -162,6 +179,7 @@ def load_data():
             del data # Free huge memory immediately
 
             if not filtered_data:
+                 st.error("No relevant instruments found after filtering NSE.json (NSE_FO + EQUITY/INDEX).")
                  return pd.DataFrame(), pd.DataFrame()
 
             # Convert to DataFrame
@@ -169,10 +187,15 @@ def load_data():
             del filtered_data # Free list memory
             
             # Save to fast cache for next run
-            df.to_pickle(CACHE_FILE)
+            try:
+                df.to_pickle(CACHE_FILE)
+            except Exception as e:
+                st.warning(f"Failed to save pickle cache: {e}")
             
         except Exception as e:
             st.error(f"Error loading NSE.json: {e}")
+            import traceback
+            st.code(traceback.format_exc())
             return pd.DataFrame(), pd.DataFrame()
 
     # --- Process DataFrames ---
@@ -225,6 +248,16 @@ with st.spinner("Initializing Application and Loading Data..."):
 
 if futures_df.empty or options_df.empty:
     st.error("Failed to load instruments data. Please check your internet connection and restart.")
+    if st.button("Clear Cache & Retry"):
+        st.cache_data.clear()
+        # Also try to delete the local files if they are suspected to be corrupt
+        for f in [INSTRUMENTS_FILE, CACHE_FILE]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+        st.rerun()
     st.stop()
 
 # --- API Functions ---
